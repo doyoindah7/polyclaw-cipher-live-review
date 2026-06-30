@@ -1,0 +1,141 @@
+"""Aggressive compounding position sizer — v3.3.0 with dynamic cash buffer.
+
+v3.3.0 changes (based on Claude + Lisa + Grok consensus):
+- Dynamic cash buffer: auto-increase reserve if deployed > 70%
+- Per-strategy cap (strategy_max_pct) is now PRIMARY source of truth
+- Global max_pct_per_trade is now safety CEILING only (not effective cap)
+- Fixes 3-layer config conflict: strategies.*.max_position_pct (dead) +
+  risk.per_strategy.*.max_capital_pct (primary) + risk.sizer.max_pct_per_trade (ceiling)
+"""
+from __future__ import annotations
+
+from typing import Any
+
+
+class CompoundingSizer:
+    """Position sizing for aggressive compounding with dynamic cash buffer.
+
+    - Per-strategy cap (strategy_max_pct) = PRIMARY source of truth
+    - Global max_pct_per_trade = safety ceiling only (catch typos)
+    - Dynamic cash buffer: if deployed > threshold, force higher reserve
+    """
+
+    def __init__(self, config: dict[str, Any] | None = None, tier_manager=None):
+        self.tier_manager = tier_manager
+        c = config or {}
+        self.cash_min_pct = c.get("cash_min_pct", 15)  # v3.3.0: 10→15
+        self.max_pct_per_trade = c.get("max_pct_per_trade", 0.65)  # v3.3.0: ceiling only
+        self.min_position_usd = c.get("min_position_usd", 2.0)
+        # v3.5.12: Absolute position cap for realistic simulation
+        self.max_absolute_position = c.get("max_absolute_position", 500.0)
+        # Confidence scaling: low conf = 0.6x, high conf = 1.3x
+        self.confidence_min_mult = c.get("confidence_min_mult", 0.6)
+        self.confidence_max_mult = c.get("confidence_max_mult", 1.3)
+        # v3.3.0: Dynamic cash buffer
+        self.dynamic_cash_buffer = c.get("dynamic_cash_buffer", True)
+        self.high_deploy_threshold = c.get("high_deploy_threshold", 0.70)
+        self.high_deploy_reserve = c.get("high_deploy_reserve", 0.25)
+
+    def size(
+        self,
+        bankroll: float,
+        cash: float,
+        open_positions_for_strategy: int,
+        max_positions_for_strategy: int,
+        confidence: float,
+        strategy_max_pct: float,
+        total_open_positions: int = 0,
+        max_total_positions: int = 10,
+    ) -> float:
+        """Calculate position size in USD.
+
+        Args:
+            bankroll: Total equity (cash + invested)
+            cash: Available cash
+            open_positions_for_strategy: Current open positions for THIS strategy
+            max_positions_for_strategy: Max concurrent for THIS strategy
+            confidence: Signal confidence 0-1
+            strategy_max_pct: Per-strategy max capital % (PRIMARY source of truth)
+            total_open_positions: v3.5.5 — total open positions across ALL strategies
+            max_total_positions: v3.5.5 — global max_open_positions from config
+        """
+        # v3.5.5 FIX (P0-02): Hard block when total positions exceed global limit
+        # Prevents bot from opening 13+ positions when max_open_positions=10 in config
+        if total_open_positions >= max_total_positions:
+            return 0.0
+        # Also block if over limit by 30%+ (defensive — shouldn't happen but safety net)
+        if total_open_positions >= int(max_total_positions * 1.3):
+            return 0.0
+
+        # v3.5.5 FIX (P0-02): When cash is critically low (< $1), block ALL new entries
+        # This is the actual deadlock condition — bot cannot meaningfully trade with $0.47
+        # Better to wait for positions to close naturally than to open tiny positions
+        if cash < 1.0:
+            return 0.0
+
+        # v3.3.0: Dynamic cash buffer — auto-increase reserve if over-deployed
+        # v3.3.1 fix: Deadlock prevention — if cash < reserve (over-deployed),
+        # don't block entirely. Allow emergency trading with reduced size.
+        effective_cash_min_pct = self.cash_min_pct
+        if self.dynamic_cash_buffer and bankroll > 0:
+            deployed_pct = (bankroll - cash) / bankroll
+            if deployed_pct > self.high_deploy_threshold:
+                effective_cash_min_pct = self.high_deploy_reserve * 100  # Force 25%
+
+        # Cash reserve (global, potentially dynamic)
+        reserve = bankroll * (effective_cash_min_pct / 100.0)
+        deployable = max(0.0, cash - reserve)
+
+        # v3.3.1 fix: Emergency mode — if deployable = 0 but cash > min_position_usd,
+        # allow reduced trading (50% of available cash) to prevent deadlock.
+        # v3.5.5: TIGHTENED — only allow emergency trades for high-confidence signals (>= 0.75)
+        # Low-confidence signals in emergency mode just burn cash without good expected value
+        if deployable < self.min_position_usd and cash > self.min_position_usd:
+            if confidence >= 0.75:
+                deployable = cash * 0.3  # v3.5.5: was 0.5, more conservative
+            else:
+                return 0.0  # v3.5.5: Block low-conf emergency trades
+
+        free_slots = max(1, max_positions_for_strategy - open_positions_for_strategy)
+        base_notional = deployable / free_slots
+
+        # Confidence scaling
+        conf_mult = self.confidence_min_mult + confidence * (
+            self.confidence_max_mult - self.confidence_min_mult
+        )
+        notional = base_notional * conf_mult
+
+        # v3.5.16: Tier-based overrides — read from tier_manager if available
+        tier_cfg = {}
+        if self.tier_manager:
+            tier_cfg = self.tier_manager.get_config(bankroll)
+        tier_max_pct = tier_cfg.get("max_pct_per_trade", self.max_pct_per_trade)
+        tier_min_pos = tier_cfg.get("min_position_usd", self.min_position_usd)
+        tier_max_pos = tier_cfg.get("max_open_positions", max_total_positions)
+        # Override global max from tier if tier_manager is active
+        effective_max_total = tier_max_pos if self.tier_manager else max_total_positions
+        
+        # Re-check position limit with tier override
+        if total_open_positions >= effective_max_total:
+            return 0.0
+        if total_open_positions >= int(effective_max_total * 1.3):
+            return 0.0
+        
+        # v3.3.0: Caps — per-strategy is PRIMARY, global is ceiling only
+        # Order matters: per-strategy cap applied FIRST (primary source of truth),
+        # then global/tier ceiling as safety net (catch typos like 5.0 = 500%)
+        notional = min(notional, bankroll * strategy_max_pct)  # PRIMARY cap
+        notional = min(notional, bankroll * tier_max_pct)  # Tier-aware ceiling
+        notional = min(notional, cash * 0.95)  # Always leave 5% buffer
+
+        # v3.5.12: Absolute position cap — prevent unrealistic size explosion
+        # At large bankrolls (>$5k), Tier 1 20% positions become impossible to fill live
+        # This caps the notional at a realistic maximum for Polymarket liquidity
+        if self.max_absolute_position > 0:
+            notional = min(notional, self.max_absolute_position)
+
+        # Hard floor (tier-aware min)
+        if notional < tier_min_pos:
+            return 0.0
+
+        return round(notional, 2)

@@ -1,0 +1,138 @@
+"""Wallet state — bankroll & cash management via SQLite.
+
+v3.4.0 FIX: Added InsufficientFundsError guard on debit() to prevent
+negative cash from concurrent signal execution (BUG-C2).
+"""
+from __future__ import annotations
+
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class InsufficientFundsError(Exception):
+    """Raised when wallet has insufficient cash for a debit operation."""
+    pass
+
+
+class Wallet:
+    """Persistent wallet state backed by SQLite."""
+
+    def __init__(self, db, initial_bankroll: float = 25.0):
+        self.db = db
+        self.initial_bankroll = initial_bankroll
+        self._bankroll: float = 0.0
+        self._cash: float = 0.0
+        # v3.4.0: Cash reservation to prevent over-allocation races (STRAT-3)
+        self._reserved_cash: float = 0.0
+
+    async def load(self) -> None:
+        """Load wallet from DB, init if fresh."""
+        row = await self.db.fetchone("SELECT * FROM wallet WHERE id = 1")
+        if row is None:
+            # Fresh init
+            self._bankroll = self.initial_bankroll
+            self._cash = self.initial_bankroll
+            await self._save()
+            logger.info("Wallet initialized: $%.2f", self._bankroll)
+        else:
+            self._bankroll = row["bankroll"]
+            self._cash = row["cash"]
+            # v3.6.0: NEVER override initial_bankroll from DB — config/env is source of truth
+            logger.info("Wallet loaded: bankroll=$%.2f, cash=$%.2f (initial from config: $%.2f)", 
+                       self._bankroll, self._cash, self.initial_bankroll)
+
+    async def _save(self) -> None:
+        await self.db.execute(
+            "INSERT OR REPLACE INTO wallet (id, bankroll, cash, initial_bankroll, updated_at) VALUES (1, ?, ?, ?, ?)",
+            (self._bankroll, self._cash, self.initial_bankroll, time.time()),
+        )
+
+    @property
+    def bankroll(self) -> float:
+        # bankroll = cash + sum(invested of open positions)
+        # Computed lazily via repository — for simplicity here return cached
+        return self._bankroll
+
+    @property
+    def cash(self) -> float:
+        return self._cash
+
+    @property
+    def available_cash(self) -> float:
+        """Cash that is not reserved for pending trades."""
+        return max(0.0, self._cash - self._reserved_cash)
+
+    def reserve(self, amount: float) -> None:
+        """Reserve cash for a pending order to prevent other strategies from double-allocating it."""
+        self._reserved_cash += amount
+        logger.debug("Reserved cash: $%.2f (total reserved: $%.2f)", amount, self._reserved_cash)
+
+    def release(self, amount: float) -> None:
+        """Release reserved cash (on fill or fail/cancel)."""
+        self._reserved_cash = max(0.0, self._reserved_cash - amount)
+        logger.debug("Released cash: $%.2f (total reserved: $%.2f)", amount, self._reserved_cash)
+
+    def has_funds(self, amount: float) -> bool:
+        """Check if wallet has sufficient AVAILABLE cash for a debit. Thread-safe pre-check."""
+        return self.available_cash >= amount
+
+    async def debit(self, amount: float) -> None:
+        """Reduce cash (when opening position).
+
+        v3.4.0 FIX (BUG-C2): Guard against negative cash.
+        If 2 signals execute nearly simultaneously, both could pass sizer checks
+        but combined debit exceeds available cash. This guard prevents corruption.
+
+        Raises:
+            InsufficientFundsError: if cash < amount
+        """
+        if amount <= 0:
+            logger.warning("Wallet debit called with non-positive amount: $%.4f", amount)
+            return
+        if self._cash < amount:
+            raise InsufficientFundsError(
+                f"Insufficient cash: have ${self._cash:.4f}, need ${amount:.4f} "
+                f"(shortfall ${amount - self._cash:.4f})"
+            )
+        self._cash -= amount
+        await self._save()
+
+    async def credit(self, amount: float) -> None:
+        """Add cash (when closing position — return invested + pnl)."""
+        if amount < 0:
+            logger.warning("Wallet credit called with negative amount: $%.4f (treating as loss)", amount)
+        self._cash += amount
+        await self._save()
+
+    async def set_bankroll(self, value: float) -> None:
+        """Update bankroll after recompute (called by repository)."""
+        self._bankroll = value
+        await self._save()
+
+    async def sync_from_clob(self, real_balance: float, total_invested: float = 0.0) -> None:
+        """Sync wallet from real CLOB balance (live mode).
+        
+        CLOB real_balance = free collateral (money ALREADY spent on positions is gone).
+        So equity/bankroll = real_balance + total_invested (total portfolio value).
+        Cash = real_balance (free, minus any locked in open orders — caller handles).
+        """
+        old_br = self._bankroll
+        old_cash = self._cash
+        self._bankroll = real_balance + total_invested  # Total equity = free cash + position value
+        self._cash = max(0.0, real_balance)  # Free cash (caller adjusts for locked orders)
+        self._reserved_cash = 0.0  # Clear reservations on sync
+        await self._save()
+        logger.warning(
+            "Wallet synced from CLOB: bankroll $%.2f → $%.2f, cash $%.2f → $%.2f",
+            old_br, self._bankroll, old_cash, self._cash,
+        )
+
+    def snapshot(self) -> dict:
+        return {
+            "bankroll": round(self._bankroll, 4),
+            "cash": round(self._cash, 4),
+            "initial_bankroll": round(self.initial_bankroll, 4),
+            "pnl": round(self._bankroll - self.initial_bankroll, 4),
+        }

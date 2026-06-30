@@ -1,0 +1,47 @@
+# PolyClaw-Cipher v3.5.19 — $15 Micro Live Test (fixed sizer)
+# Overlay di atas default.yaml base
+# Port 8084, data_fifteen/
+
+bot:
+  scan_interval_sec: 60
+  loop_interval_sec: 1
+
+tier:
+  force_tier: 0
+
+risk:
+  initial_bankroll_usd: 15.0
+  max_consecutive_losses_global: 6
+  max_daily_drawdown_pct: 40.0
+  max_trades_per_hour_global: 30
+  # v3.5.19 FIX: sizer moved under risk (Bug #7 — root-level stripped by Pydantic)
+  sizer:
+    min_position_usd: 1.0
+    max_pct_per_trade: 0.10
+    cash_min_pct: 30
+    max_open_positions: 4
+  per_strategy:
+    momentum:
+      max_consecutive_losses: 4
+      max_trades_per_hour: 20
+      max_capital_pct: 0.40
+
+strategies:
+  latency_arb:
+    enabled: false
+  atomic_arb:
+    enabled: false
+  resolution_snipe:
+    enabled: false
+  momentum:
+    enabled: true
+    max_positions: 4
+    min_entry_price: 0.10
+    max_entry_price: 0.95
+    min_position_usd: 1.0
+    max_per_market_pct: 0.25
+    take_profit_pct: 8.0
+    stop_loss_pct: 7.6
+    max_hold_sec: 60
+    cooldown_sec: 45
+    allowed_categories: ["crypto", "sports_match", "sports_total", "sports_spread", "economics", "politics", "entertainment", "other"]

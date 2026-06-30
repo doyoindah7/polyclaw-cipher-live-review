@@ -1,0 +1,37 @@
+services:
+  polyclaw-cipher-v3:
+    build: .
+    container_name: polyclaw-cipher-v3
+    restart: unless-stopped
+    ports:
+      # PUBLIC ACCESS — like v2 (port 8080)
+      # Dashboard v3: http://3.107.53.103:8082/
+      # Dashboard v2: http://3.107.53.103:8080/ (unchanged)
+      - "8082:8082"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    environment:
+      - BOT_MODE=paper
+      - SKIP_AUTO_TUNE=1
+      - TG_BOT_TOKEN=8823623175:AAEr9Rw_y4caPN8LUga-UtYY8izvBcL5vgo
+      - TG_CHAT_ID=2051570522
+      - INITIAL_BANKROLL_USD=25.00
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8082
+      - LOG_FORMAT=json
+    env_file:
+      - .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    mem_limit: 1g
+    cpus: 1.0
+    network_mode: bridge
+    # v3.5.5 FIX (P0-01): Log rotation — prevents disk fill from unbounded json logs
+    # LATENCY_ARB log spam was filling disk; rotation keeps last 5×10MB = 50MB max
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -1,0 +1,66 @@
+# PolyClaw-Cipher v3.6.0 — LIVE Bot
+# Deposit wallet: 0xf9f38a1dc12fc665222734cf73b1a8f5daf24e9a
+# Sig type: 3 (POLY_1271)
+
+bot:
+  scan_interval_sec: 30
+  loop_interval_sec: 3
+  mode: live
+  max_open_positions: 8
+
+execution:
+  fee_rate_bps: 25
+  signature_type: 3
+  max_retries: 2
+  retry_delay_sec: 1
+
+tier:
+  force_tier: 0
+
+risk:
+  initial_bankroll_usd: 10.0
+  max_consecutive_losses_global: 7
+  max_daily_drawdown_pct: 50.0
+  max_trades_per_hour_global: 50
+  sizer:
+    min_position_usd: 1.00
+    max_pct_per_trade: 0.17
+    cash_min_pct: 5
+    max_open_positions: 4
+  per_strategy:
+    momentum:
+      max_consecutive_losses: 5
+      max_trades_per_hour: 40
+      max_capital_pct: 0.17
+
+strategies:
+  latency_arb:
+    enabled: false
+  atomic_arb:
+    enabled: false
+  resolution_snipe:
+    enabled: false
+  momentum:
+    enabled: true
+    max_positions: 4
+    min_entry_price: 0.05
+    max_entry_price: 0.95
+    min_position_usd: 1.00
+    max_per_market_pct: 0.35
+    take_profit_pct: 8.0
+    stop_loss_pct: 4.0
+    max_hold_sec: 300
+    cooldown_sec: 30
+    lookback_short_sec: 60
+    lookback_long_sec: 180
+    min_momentum_short_pct: 0.005
+    min_momentum_long_pct: 0.002
+    min_confidence: 0.20
+    max_volatility: 0.99
+    max_notional_pct: 0.17
+    force_signal_mode: true
+    allowed_categories: ["crypto", "sports_match", "sports_total", "sports_spread", "economics", "politics", "entertainment", "other"]
+
+auto_tune:
+  enabled: false
+  v2_enabled: false

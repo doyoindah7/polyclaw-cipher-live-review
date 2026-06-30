@@ -1,0 +1,319 @@
+# PolyClaw-Cipher v3 — Aggressive Growth Config
+# Target: $25 → aggressive compounding via 5-strategy HFT approach
+# Optimized for: t2.small (2GB RAM) VPS — v2 stopped, v3 only
+
+bot:
+  mode: paper
+  loop_interval_sec: 1                # Main loop tick (1s — strategies event-driven)
+  scan_interval_sec: 60               # Gamma API scan (WS handles real-time)
+  max_open_positions: 10              # Total across all strategies
+
+# v3.5.17: Auto-Tune v2 — Dynamic market-aware config engine
+# Per-feature toggles: disable individual features without killing whole system
+auto_tune:
+  enabled: true                # master switch (env SKIP_AUTO_TUNE=1 overrides)
+  mode: hybrid                 # startup | hybrid (startup + periodic updates)
+  update_interval_hours: 1     # periodic update every 1 hour
+  min_new_trades: 10           # skip update if <10 new trades since last
+  max_change_pct: 20           # max 20% change per parameter per update
+  rollback_wr: 40              # skip update if recent WR < 40%
+  features:
+    entry_range: true           # per-category entry price [min, max]
+    momentum_threshold: true    # per-category short/long momentum %
+    hold_time: true             # per-category max hold time
+    tp_sl: true                 # per-category TP/SL %
+    category_blacklist: true    # auto-disable categories with WR < 40% (min 50 trades)
+    side_bias: true             # prefer YES or NO per category
+    max_positions: true         # per-category concurrency cap
+
+market:
+  min_volume_24h_usd: 500
+  min_liquidity: 100
+  api_page_size: 500
+  max_pages: 3
+  # Real resolution detection (fix v2 bug)
+  # Check `closed` and `resolvedBy` fields, not just end_date
+  track_max_markets: 200               # Max markets to track in CLOB WS (memory limit)
+
+# === STRATEGY 1: LATENCY ARBITRAGE (Binance → Polymarket) ===
+# Edge: PM odds adjust 200-500ms AFTER Binance price move
+strategies:
+  latency_arb:
+    enabled: false  # v3.5.16: disabled — WR 30%, -$94
+    min_edge_pct: 1.0                 # v3.4.4: lowered from 2.0→1.5→1.0 (Kimi+Arena audit — PM efficient, 2% never fires)
+    max_position_pct: 0.25            # 25% bankroll per trade (aggressive)
+    max_positions: 3
+    take_profit_pct: 5.0
+    stop_loss_pct: 3.0
+    exit_before_close_sec: 30
+    cooldown_sec: 10
+
+  # === STRATEGY 2: ATOMIC ARBITRAGE (YES + NO < $1) ===
+  # Edge: Risk-free profit when YES ask + NO ask < $1
+  # Lowered threshold 100→40 bps (Polymarket markets efficient, real arbs are 20-50 bps)
+  # v3.3.1: Added category filter (was missing — traded sports_spread)
+  atomic_arb:
+    enabled: false  # v3.5.16: disabled — 50% WR, arb window closed by HFT bots (73% profits captured sub-100ms)
+    min_profit_bps: 100  # v3.5.8: 80->100 (sweet spot) — avoid break-even arb                # Min 0.4% profit after fees (lowered from 100)
+    max_position_pct: 0.40            # 40% bankroll per arb (low risk)
+    max_concurrent: 8  # v3.5.8: 5->8 (risk-free, capture more)
+    scan_interval_sec: 1              # Event-driven, fast check
+    # v3.3.1: Category filter — skip random-outcome markets
+    skip_random_outcome: false
+    allowed_categories: ["crypto", "sports_match", "sports_total", "sports_spread", "economics", "politics", "entertainment", "other"]
+
+  # === STRATEGY 3: RESOLUTION SNIPING ===
+  # v3.3.0: Relaxed price band 0.90→0.88 + time 24h→72h (measurement mode)
+  #         Added politics to allowed_categories. NO sports (tail risk -93% on upset).
+  #         Based on consensus Claude + Lisa + Grok: keep category filter, relax thresholds.
+  resolution_snipe:
+    enabled: false  # v3.5.7: disabled — WR 12.5%, frees $50+ cash
+    min_odds: 0.92                    # v3.5.5 FIX (P0-05): was 0.88 — only near-certain markets
+    max_odds: 0.97
+    max_hours_to_close: 24            # v3.5.5 FIX (P0-05): was 72 — only fast-resolve markets
+    # LLM disabled until API key configured
+    llm_enabled: false
+    llm_min_confidence: 0.85
+    max_position_pct: 0.15            # Conservative (modal terkunci)
+    max_concurrent: 3                 # v3.5.5 FIX (P0-05): was 5 — limit exposure while under review
+    cooldown_sec: 60
+    # TP/SL exit
+    stop_loss_pct: 10.0               # Exit if odds drop -10% from entry (cut losses)
+    take_profit_pct: 15.0             # Exit if odds rise +15% (take early profit)
+    # v3.3.0: Category filter — NO sports (tail risk). Added politics.
+    skip_random_outcome: false
+    allowed_categories: ["crypto", "sports_match", "sports_total", "sports_spread", "economics", "politics", "entertainment", "other"]
+
+  # === STRATEGY 4: MOMENTUM (refined v2 universal) ===
+  # Uses CLOB WS for 60x faster reaction
+  momentum:
+    enabled: true
+    lookback_short_sec: 30
+    lookback_long_sec: 120
+    min_momentum_short_pct: 0.5  # v3.5.6 AGGRESSIVE: 1.0->0.5
+    min_momentum_long_pct: 0.25  # v3.5.6 AGGRESSIVE: 0.5->0.25
+    take_profit_pct: 8.0
+    stop_loss_pct: 4.0
+    max_hold_sec: 300                 # 5 minutes
+    max_position_pct: 0.15
+    max_positions: 6  # v3.5.7: 3->6
+    cooldown_sec: 30
+    min_entry_price: 0.10   # v3.5.6 AGGRESSIVE: 0.30->0.10            # FIX: raised from 0.05 — skip low-prob entries
+    max_entry_price: 0.95
+    # v3.3.0: Category filter — sports_spread EXCLUDED (random), sports_total ALLOWED (predictable)
+    skip_random_outcome: false
+    allowed_categories: ["crypto", "sports_match", "sports_total", "sports_spread", "economics", "politics", "entertainment", "other"]
+    # Volume Spike Detector: lowers threshold 15% when tick rate >3x normal
+    vol_spike_enabled: true
+    vol_spike_threshold: 3.0
+    vol_spike_boost: 0.15
+    vol_spike_confidence_boost: 0.10
+
+  # === STRATEGY 5: NEWS LLM (DEFERRED — no API key yet) ===
+  # Stub interface ready, autoclaw will activate
+  news_llm:
+    enabled: false
+    llm_model: "glm-4.5"
+    max_llm_latency_sec: 30
+    min_confidence: 0.70
+    max_position_pct: 0.10
+    max_positions: 2
+    take_profit_pct: 15.0
+    stop_loss_pct: 8.0
+    max_hold_sec: 600
+    sources:
+      nitter_instances:
+        - "https://nitter.net"
+        - "https://nitter.privacydev.net"
+      twitter_accounts:
+        - "Polymarket"
+        - "binance"
+        - "CoinDesk"
+      rss_feeds:
+        - "https://www.coindesk.com/arc/outboundfeeds/rss/"
+        - "https://www.theblock.co/rss.xml"
+
+  # === STRATEGY 6: CONVERGENCE SCALPER (Bone Reaper) ===
+  # v3.5.16: Buy winning token dips <30min before market close
+  # Default disabled — enable per-instance
+  convergence_scalper:
+    enabled: false
+    max_minutes_to_close: 30
+    min_winning_price: 0.97
+    max_entry_price: 0.955
+    take_profit_pct: 5.0
+    stop_loss_pct: 3.0
+    max_position_pct: 0.25
+    max_concurrent: 3
+    min_profit_bps: 50
+    allowed_categories: [crypto, sports_match, sports_total, economics, politics, entertainment, other]
+
+# === RISK MANAGEMENT — Aggressive but Protected ===
+risk:
+  initial_bankroll_usd: 25.00
+  max_daily_drawdown_pct: 50.0        # Aggressive (paper trading)
+  max_consecutive_losses_global: 8
+  max_trades_per_hour_global: 60
+  session_rotation_min: 240           # 4 hours
+  max_net_exposure_per_asset_pct: 50.0 # Max net exposure to any single asset (e.g. BTC) as % of bankroll
+  # v3.5.5 FIX (P1-05): Force-close stale positions to free cash
+  max_position_age_sec: 1800          # 30 min — close ALL stale positions
+  dead_position_age_sec: 900          # 15 min — close "dead" positions (0% PnL movement) sooner
+
+  per_strategy:
+    latency_arb:
+      max_consecutive_losses: 5
+      max_trades_per_hour: 30
+      max_capital_pct: 0.60
+    atomic_arb:
+      max_consecutive_losses: 3       # Arb should never lose — if 3, something wrong
+      max_trades_per_hour: 50
+      max_capital_pct: 0.50
+    resolution_snipe:
+      max_consecutive_losses: 3
+      max_trades_per_hour: 20
+      max_capital_pct: 0.40
+    momentum:
+      max_consecutive_losses: 5
+      max_trades_per_hour: 40
+      max_capital_pct: 0.45
+    news_llm:
+      max_consecutive_losses: 3
+      max_trades_per_hour: 15
+      max_capital_pct: 0.20
+    convergence_scalper:
+      max_consecutive_losses: 3
+      max_trades_per_hour: 20
+      max_capital_pct: 0.30
+
+  sizer:
+    type: "aggressive_compounding"
+    cash_min_pct: 15                  # v3.3.0: 10→15 (middle ground Grok 20% + Lisa dynamic)
+    max_pct_per_trade: 0.65           # v3.3.0: global ceiling (was 0.25 effective cap), now safety only
+    min_position_usd: 2.00
+    # v3.3.0: Dynamic cash buffer — auto-increase reserve if deployed > 70%
+    dynamic_cash_buffer: true
+    high_deploy_threshold: 0.70       # If deployed > 70%, force cash_min_pct to high_deploy_reserve
+    high_deploy_reserve: 0.25         # Force 25% cash buffer when over-deployed
+
+# === EXECUTION ===
+execution:
+  mode: paper  # "paper" | "live"
+
+  # v3.5.16: Polygon RPC endpoints (for live trading)
+  rpc:
+    primary: "https://polygon.llamarpc.com"       # 7ms from Ireland, DefiLlama
+    fallback: "https://rpc.ankr.com/polygon"      # 80ms, Ankr public
+    emergency: "https://polygon-rpc.com"           # 82ms, Polygon public
+    chain_id: 137                                   # Polygon PoS mainnet
+    max_retries: 3
+    retry_delay_sec: 1.0
+    timeout_sec: 10
+
+  # Live trading via Polymarket CLOB API + Relayer
+  live:
+    # Builder/relayer config (from .env: BUILDER_PROFILE, RELAYER_API_KEY)
+    relayer_enabled: false
+    # Gas strategy (Polygon fees are cheap but can spike)
+    gas:
+      max_fee_per_gas_gwei: 500      # Cap at 500 gwei
+      priority_fee_gwei: 30          # Standard priority
+      gas_limit: 500000               # Typical order tx
+      # Dynamic adjustment: if pending > 10s, bump priority by 20%
+      dynamic_priority: true
+      priority_bump_pct: 0.20
+    # Slippage for live orders (on-chain, not simulated)
+    slippage_bps: 50                  # 0.5% default slippage
+    max_slippage_bps: 200             # 2% worst case
+    # Order splitting: if position > $500, split into multiple orders
+    max_order_usd: 500
+    split_enabled: true
+    # Confirmation wait
+    tx_confirm_blocks: 1              # Wait 1 block for confirmation
+    tx_timeout_sec: 60                # Fail if not confirmed in 60s
+
+  # Paper trading simulation
+  paper:
+    # === v3.5.13 LIVE-REALISM TIER 1 (autoclaw-reviewed parameters) ===
+    # Slippage: liquidity-based (function of notional / volume_24h)
+    slippage_model: "liquidity"        # "fixed" (legacy) | "liquidity" (recommended)
+    slippage_bps: 70                   # fallback when volume_24h unavailable
+    slippage_min_bps: 30               # very liquid markets (World Cup)
+    slippage_max_bps: 800              # very illiquid markets (politics minor)
+
+    # Fill probability: volatility-aware (autoclaw: 72% base, not 85%)
+    fill_probability_base: 0.72        # normal markets
+    fill_probability_volatile: 0.65    # sport/crypto (high vol, fast price move)
+    fill_probability_stable: 0.80      # economics/politics (low vol)
+    fill_probability_at_bid_low: 0.90
+    fill_probability_at_bid_high: 0.55
+    queue_position_factor: 0.6
+
+    # Latency: slightly faster (was 0.2s, now 0.15s — VPS already 1ms to PM)
+    simulated_latency_sec: 0.15
+
+    # On-chain settlement delay (Polygon block time)
+    on_chain_delay_sec: 3.0            # average block time
+    on_chain_delay_jitter: 2.0         # ±2s random (1-5s range)
+
+    # Gas fee model (Polygon, realistic avg + spike)
+    gas_fee_avg_usd: 0.01              # normal congestion
+    gas_fee_spike_probability: 0.05    # 5% chance of congestion spike
+    gas_fee_spike_usd: 0.10            # spike amount (NFT drop, big event)
+
+    # API rate limit simulation
+    api_rate_limit_per_sec: 10         # PM CLOB API limit
+    api_throttle_probability: 0.02     # 2% random throttle (network jitter)
+
+
+# === MONITORING ===
+monitoring:
+  log_level: INFO
+  log_format: json
+  web:
+    enabled: true
+    host: 0.0.0.0                     # PUBLIC ACCESS
+    port: 8082                        # v3 dashboard port
+    username: ""
+    password: ""
+  heartbeat_sec: 5
+  metrics_enabled: true               # Prometheus /metrics endpoint
+
+# v3.5.16 Tier-Based Dynamic Sizer — CONFIGURABLE PER TIER
+# Set force_tier: 0 for auto-transition, or 1-4 to lock.
+# Override any tier parameter in tiers.N block below.
+tier:
+  mode: auto
+  force_tier: 0  # v3.5.16: UNLOCKED for auto-transition
+  cooldown_hours: 24
+  tiers:
+    1:
+      label: "Aggressive Growth"
+      min_position_usd: 3.0
+      max_pct_per_trade: 0.20
+      max_open_positions: 10
+      enter_next: 350
+      description: "$25-$350"
+    2:
+      label: "Moderate Growth"
+      min_position_usd: 12.0
+      max_pct_per_trade: 0.17
+      max_open_positions: 8
+      enter_next: 1100
+      exit_prev: 225
+      description: "$350-$1,100"
+    3:
+      label: "Capital Preservation"
+      min_position_usd: 30.0
+      max_pct_per_trade: 0.06
+      max_open_positions: 6
+      enter_next: 5500
+      exit_prev: 900
+      description: "$1,100-$5,500"
+    4:
+      label: "Aggressive Growth Tier-4"
+      min_position_usd: 85.0
+      max_pct_per_trade: 0.12
+      max_open_positions: 7
+      exit_prev: 4500
+      description: "$5,500+"
